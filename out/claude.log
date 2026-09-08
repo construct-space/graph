@@ -1,0 +1,10 @@
+Report written to `out/report.txt`.
+
+**Finding: Unauthenticated SQL Injection (CVSS 10.0)**
+
+The `DELETE /api/admin/schemas/{name}` endpoint has two compounding flaws:
+
+1. **No authentication** — all `/api/admin/*` routes are registered without the `requireAuth()` middleware that protects other endpoints (main.go:130-142)
+2. **SQL injection** — the `{name}` path parameter is directly concatenated into `DROP SCHEMA IF EXISTS " + name + " CASCADE` (admin.go:190)
+
+Any anonymous attacker can execute arbitrary SQL against the PostgreSQL database — read all tenant data, drop every schema, or escalate to superuser.
